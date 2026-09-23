@@ -195,7 +195,7 @@ aws dynamodb create-table \
 
 On-demand billing suits agent traffic, which is bursty and idles at zero, but provisioned capacity works identically.
 
-**TTL (optional).** Constructing the storage with a TTL stamps an epoch-seconds `expireAt` attribute on every item and filters already-expired items on `read` / `list`. For DynamoDB to physically reap expired items, enable TTL on the table once:
+**TTL (optional).** Constructing the storage with a TTL stamps an epoch-seconds `expireAt` attribute on every item and filters already-expired items on `read` / `list` / `search`. For DynamoDB to physically reap expired items, enable TTL on the table once:
 
 ```bash
 aws dynamodb update-time-to-live \
@@ -265,7 +265,7 @@ Both languages ship the same capabilities with identical semantics.
 - **Single-table design.** The `/`-separated key maps to a partition key (leading scope) plus a sort key (remainder), so point operations are single-item `PutItem` / `GetItem` / `DeleteItem` and listing is a partition `Query`. No GSI required.
 - **S3 offload for large values.** Values above the DynamoDB item-size limit are transparently offloaded to [Amazon S3](https://aws.amazon.com/s3/) (opt-in `s3Bucket`), with a small pointer item remaining in DynamoDB. Callers see one byte contract regardless of size.
 - **Optional gzip compression.** Applied before the offload size check, so compressible values stay inline at lower cost. Each item records whether it was compressed, so reads are correct regardless of the setting.
-- **Optional TTL.** Writes stamp a DynamoDB-native epoch-seconds attribute, and `read` / `list` also filter already-expired items, covering the window before DynamoDB physically deletes them.
+- **Optional TTL.** Writes stamp a DynamoDB-native epoch-seconds attribute, and `read` / `list` / `search` also filter already-expired items, covering the window before DynamoDB physically deletes them.
 - **Vector search.** `search()` calls DynamoDB `SearchVectors` natively against a vector index on the table, with the search condition pinned to the caller's partition, bounded `TopK`, and results in most-similar-first order. Consumers feature-detect (`if (storage.search)`) and fall back to client-side KNN when absent. The store searches pre-computed embedding vectors and does not embed text; a plain-string query is rejected with a clear error. Like a global secondary index, the vector index is eventually consistent.
 - **Multi-tenant prefixes.** A constructor-bound prefix namespaces every key, enforced on both structured and string-prefix queries.
 - **Lazy, peer-declared AWS clients.** The AWS SDK clients are lazy-loaded and declared as peer (optional) dependencies, so consumers that never construct a `DynamoDBStorage` are not forced to install them.

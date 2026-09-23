@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { SearchVectorsCommand, type SearchVectorsCommandInput } from '@aws-sdk/client-dynamodb'
 import { PutCommand, GetCommand, DeleteCommand, QueryCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import { marshall } from '@aws-sdk/util-dynamodb'
@@ -833,5 +833,86 @@ describe('DynamoDBStorage — namespace isolation', () => {
       data: bytes('x'),
     })
     expect(await b.list({ pk: 'tenant-b/sessions' })).toEqual(['sessions/s1/mine'])
+  })
+})
+
+describe('DynamoDBStorage — search TTL validation', () => {
+  for (const native of [false, true]) {
+    for (const includeValues of [false, true]) {
+      for (const ttlAttribute of ['expireAt', 'customTTL']) {
+        it(`filters base-table TTL: native=${native}, values=${includeValues}, attribute=${ttlAttribute}`, async () => {
+          const now = 1_800_000_000
+          const clock = vi.spyOn(Date, 'now').mockReturnValue(now * 1000)
+          try {
+            const client = new FakeDocumentClient()
+            const s3 = new FakeS3Client()
+            const staleAdapter = vi.fn<VectorSearchAdapter>().mockResolvedValue(
+              ['expired', 'boundary', 'deleted', 'live', 'legacy'].map((k, score) => ({
+                key: `tenant/a/${k}`,
+                score,
+                data: bytes('stale'),
+              }))
+            )
+            const storage = new DynamoDBStorage('test-table', {
+              client: asDocClient(client),
+              s3Bucket: 'test-bucket',
+              s3Client: asS3Client(s3),
+              prefix: 'tenant/a',
+              ttlSeconds: 60,
+              ttlAttribute,
+              ...(native ? {} : { vectorSearch: staleAdapter }),
+            })
+            await storage.write('expired', new Uint8Array(400_001), { vector: [1], ttlSeconds: -1 })
+            await storage.write('boundary', bytes('x'), { vector: [1], ttlSeconds: 0 })
+            await storage.write('live', bytes('current'), { vector: [1] })
+            const legacy = new DynamoDBStorage('test-table', { client: asDocClient(client), prefix: 'tenant/a' })
+            await legacy.write('legacy', bytes(''), { vector: [1] })
+            const getS3 = vi.spyOn(s3, 'send').mockRejectedValue(new Error('expired S3 fetch'))
+            const send = vi.spyOn(client, 'send')
+            const topK = native ? 4 : 5
+            const results = await storage.search({ vector: [1], topK, includeValues })
+            expect(results.map((r) => r.key)).toEqual(['live', 'legacy'])
+            expect(results.map((r) => r.score)).toEqual(native ? [0, 0] : [3, 4])
+            if (includeValues) expect(results.map((r) => str(r.data ?? null))).toEqual(['current', ''])
+            getS3.mockRestore()
+            const checks = send.mock.calls
+              .map(([c]) => c)
+              .filter((c): c is GetCommand => c instanceof GetCommand && c.input.ConsistentRead === true)
+            expect(checks).toHaveLength(topK)
+            expect(checks[0]!.input.ExpressionAttributeNames).toEqual({ '#pk': 'pk', '#ttl': ttlAttribute })
+          } finally {
+            clock.mockRestore()
+          }
+        })
+      }
+    }
+  }
+
+  it('drops missing candidates and checks scope before reading, while propagating read failures', async () => {
+    const { client } = newStorage()
+    const adapter = vi.fn<VectorSearchAdapter>().mockResolvedValue([{ key: 'other/a/x', score: 0 }])
+    const storage = new DynamoDBStorage('test-table', {
+      client: asDocClient(client),
+      prefix: 'tenant/a',
+      ttlSeconds: 60,
+      vectorSearch: adapter,
+    })
+    expect(await storage.search({ vector: [1], topK: 1 })).toEqual([])
+    expect(client.getCalls).toBe(0)
+    adapter.mockResolvedValue([{ key: 'tenant/a/missing', score: 0 }])
+    expect(await storage.search({ vector: [1], topK: 1 })).toEqual([])
+    vi.spyOn(client, 'send').mockRejectedValue(new Error('unavailable'))
+    await expect(storage.search({ vector: [1], topK: 1 })).rejects.toThrow('Failed to search')
+  })
+
+  it('skips the liveness read when TTL is disabled', async () => {
+    const { client } = newStorage()
+    const storage = new DynamoDBStorage('test-table', {
+      client: asDocClient(client),
+      vectorSearch: vi.fn<VectorSearchAdapter>().mockResolvedValue([{ key: 'mem/a/x', score: 0 }]),
+    })
+    const results = await storage.search({ vector: [1], topK: 1 })
+    expect(results.map((r) => r.key)).toEqual(['mem/a/x'])
+    expect(client.getCalls).toBe(0)
   })
 })
