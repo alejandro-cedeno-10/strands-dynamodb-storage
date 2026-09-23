@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextlib
 import gzip
 import math
 import time
@@ -124,6 +125,77 @@ def _marshal_meta(meta: dict[str, _MetaValue]) -> dict[str, Any]:
     return {"M": out}
 
 
+@dataclass(frozen=True)
+class _DocumentLocation:
+    """Internal: where a document lives. ``key`` is scope-relative; ``doc_id`` is the full stored key."""
+
+    key: str
+    doc_id: str
+    pk: str
+    sk: str
+
+
+@dataclass(frozen=True)
+class _DocumentItemPort:
+    """Internal port through which the lexical index reads and writes base-table items.
+
+    Not part of the public API; obtained from :meth:`DynamoDBStorage._document_item_port`. It only
+    delegates to private storage methods, so indexed items are built by the same code as
+    :meth:`DynamoDBStorage.write`. ``ttl_attribute`` is set only when the storage opted in to TTL,
+    and ``client()`` returns the low-level boto3 client (synchronous; call it through
+    ``asyncio.to_thread``).
+    """
+
+    _storage: DynamoDBStorage
+
+    @property
+    def table_name(self) -> str:
+        """Base table name."""
+        return self._storage._table_name
+
+    @property
+    def scope(self) -> str:
+        """Storage prefix exactly as held (``"tenant/a/"`` or ``""``)."""
+        return self._storage._prefix
+
+    @property
+    def ttl_attribute(self) -> Optional[str]:
+        """TTL attribute name; ``None`` unless the storage opted in to TTL."""
+        return self._storage._ttl_attribute if self._storage._ttl_enabled else None
+
+    def client(self) -> Any:
+        """The storage's (lazily built) low-level DynamoDB client."""
+        return self._storage._get_client()
+
+    def locate(self, key: str) -> _DocumentLocation:
+        """See :meth:`DynamoDBStorage._locate`."""
+        return self._storage._locate(key)
+
+    def relative_key(self, doc_id: str) -> Optional[str]:
+        """The key relative to the storage prefix, or ``None`` when ``doc_id`` is outside it."""
+        return self._storage._strip_prefix(doc_id)
+
+    def is_expired(self, item: dict[str, Any]) -> bool:
+        """See :meth:`DynamoDBStorage._is_ttl_expired`."""
+        return self._storage._is_ttl_expired(item)
+
+    def inline_item(
+        self,
+        location: _DocumentLocation,
+        data: bytes,
+        *,
+        vector: Optional[builtins.list[float]] = None,
+        metadata: Optional[dict[str, _MetaValue]] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """See :meth:`DynamoDBStorage._inline_item`."""
+        return self._storage._inline_item(location, data, vector=vector, metadata=metadata, ttl_seconds=ttl_seconds)
+
+    async def delete_offloaded(self, doc_id: str) -> None:
+        """See :meth:`DynamoDBStorage._reclaim_offloaded`."""
+        await self._storage._reclaim_offloaded(doc_id)
+
+
 class DynamoDBStorage:
     """DynamoDB ``Storage`` backend (single-table design).
 
@@ -238,30 +310,8 @@ class DynamoDBStorage:
         full = f"{self._prefix}{normalized}"
         pk, sk = self._split(full)
 
-        extra: dict[str, Any] = {}
-        # The embedding stays inline even when the payload offloads, because the
-        # native vector index can only index an on-item attribute.
-        if vector is not None:
-            # Mirror of the query-side check in _native_vector_search: the service
-            # rejects non-finite values anyway, but as an opaque write failure.
-            if not all(math.isfinite(component) for component in vector):
-                raise StorageError("Vector contains non-finite values (nan/inf); the DynamoDB N type rejects them.")
-            extra[self._vector_attribute] = {"L": [{"N": str(component)} for component in vector]}
-        if metadata is not None:
-            extra[_META_ATTR] = _marshal_meta(metadata)
-        effective_ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
-        if self._ttl_enabled and effective_ttl is not None:
-            # Floor the whole stamp: a float duration (e.g. 90.5) must not emit a
-            # fractional value that other readers of the shared table may not parse.
-            extra[self._ttl_attribute] = {"N": str(int(time.time() + effective_ttl))}
-
-        payload = data
-        compressed = False
-        if self._compress:
-            gz = gzip.compress(data)
-            if len(gz) < len(data):
-                payload = gz
-                compressed = True
+        extra = self._item_extras(vector, metadata, ttl_seconds)
+        payload, compressed = self._encode_value(data)
         if compressed:
             extra[_Z_ATTR] = {"BOOL": True}
 
@@ -283,13 +333,7 @@ class DynamoDBStorage:
                 # object is orphaned forever (a later delete() never reaches it).
                 old = await self._put(item, return_old=bool(self._s3_bucket))
                 if old.get(_S3_ATTR, {}).get("BOOL"):
-                    try:
-                        await self._s3_delete(full)
-                    except Exception:  # noqa: BLE001
-                        # Best-effort: the write itself is durable, so a failed
-                        # cleanup must not fail it. An S3 lifecycle rule is the
-                        # backstop for missed reclamations.
-                        pass
+                    await self._reclaim_offloaded(full)
         except StorageError:
             raise
         except Exception as error:
@@ -314,7 +358,7 @@ class DynamoDBStorage:
                 return None
             # Hide items whose TTL has passed but DynamoDB has not yet reaped (only
             # when TTL is opted in). Runs before any S3 fetch.
-            if self._ttl_enabled and self._is_expired(item):
+            if self._is_ttl_expired(item):
                 return None
             compressed = item.get(_Z_ATTR, {}).get("BOOL") is True
             if item.get(_S3_ATTR, {}).get("BOOL"):
@@ -547,6 +591,114 @@ class DynamoDBStorage:
         return all(metadata.get(k) == v for k, v in filter_dict.items())
 
     # ------------------------------------------------------------------ internals
+
+    def _item_extras(
+        self,
+        vector: Optional[builtins.list[float]],
+        metadata: Optional[dict[str, _MetaValue]],
+        ttl_seconds: Optional[int],
+    ) -> dict[str, Any]:
+        """Optional item attributes shared by every write path: vector, metadata and TTL stamp.
+
+        The embedding stays inline even when the payload offloads, because the native vector
+        index can only index an on-item attribute. Non-finite components are rejected here,
+        mirroring the query-side check in :meth:`_native_vector_search`: the service rejects
+        them anyway, but as an opaque write failure. The TTL stamp is floored as a whole, so
+        a float duration (e.g. 90.5) never emits a fractional value that other readers of the
+        shared table may not parse; it is written only when this instance opted in to TTL.
+
+        Raises:
+            StorageError: If the vector contains non-finite values.
+        """
+        extras: dict[str, Any] = {}
+        if vector is not None:
+            if not all(math.isfinite(component) for component in vector):
+                raise StorageError("Vector contains non-finite values (nan/inf); the DynamoDB N type rejects them.")
+            extras[self._vector_attribute] = {"L": [{"N": str(component)} for component in vector]}
+        if metadata is not None:
+            extras[_META_ATTR] = _marshal_meta(metadata)
+        effective_ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
+        if self._ttl_enabled and effective_ttl is not None:
+            extras[self._ttl_attribute] = {"N": str(int(time.time() + effective_ttl))}
+        return extras
+
+    def _encode_value(self, data: bytes) -> tuple[bytes, bool]:
+        """Return ``(payload, compressed)``: gzip is kept only when compression is on and it shrinks."""
+        if not self._compress:
+            return data, False
+        compressed = gzip.compress(data)
+        if len(compressed) < len(data):
+            return compressed, True
+        return data, False
+
+    def _document_item_port(self) -> _DocumentItemPort:
+        """Internal: the narrow view of this storage that :class:`LexicalIndex` writes through.
+
+        Not part of the public API. The index reaches base-table behaviour only through this
+        port, so it builds items with the same helpers as :meth:`write` and never touches other
+        private members of the storage.
+        """
+        return _DocumentItemPort(self)
+
+    def _locate(self, key: str) -> _DocumentLocation:
+        """Normalize ``key`` and resolve its full stored key and base-table primary key.
+
+        Raises:
+            StorageError: If the key is invalid.
+        """
+        normalized = normalize_key(key)
+        doc_id = f"{self._prefix}{normalized}"
+        pk, sk = self._split(doc_id)
+        return _DocumentLocation(key=normalized, doc_id=doc_id, pk=pk, sk=sk)
+
+    def _inline_item(
+        self,
+        location: _DocumentLocation,
+        data: bytes,
+        *,
+        vector: Optional[builtins.list[float]] = None,
+        metadata: Optional[dict[str, _MetaValue]] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Build the item :meth:`write` would store for an inline value, with the same extras and encoding.
+
+        Indexed documents must stay inline so the lexical transaction writes them atomically, so a
+        value that would need S3 offload is rejected even when a bucket is configured.
+
+        Raises:
+            StorageError: If the vector is non-finite or the encoded payload is above the inline threshold.
+        """
+        extras = self._item_extras(vector, metadata, ttl_seconds)
+        payload, compressed = self._encode_value(data)
+        if compressed:
+            extras[_Z_ATTR] = {"BOOL": True}
+        if len(payload) > _OFFLOAD_THRESHOLD_BYTES:
+            raise StorageError(
+                f"Value for '{location.key}' is {len(payload)} bytes, above the {_OFFLOAD_THRESHOLD_BYTES}-byte "
+                "inline limit; S3 offload is not supported for indexed documents"
+            )
+        return {
+            _PK: {"S": location.pk},
+            _SK: {"S": location.sk},
+            _KEY_ATTR: {"S": location.doc_id},
+            _DATA_ATTR: {"B": payload},
+            **extras,
+        }
+
+    async def _reclaim_offloaded(self, full_key: str) -> None:
+        """Best-effort delete of the offloaded S3 object of ``full_key``; a no-op without a bucket.
+
+        Never raises: the DynamoDB write it follows is already durable, so a failed cleanup must
+        not fail it. An S3 lifecycle rule is the backstop for missed reclamations.
+        """
+        if not self._s3_bucket:
+            return
+        with contextlib.suppress(Exception):
+            await self._s3_delete(full_key)
+
+    def _is_ttl_expired(self, item: dict[str, Any]) -> bool:
+        """True when this storage opted in to TTL and the item's stamp is at or before now."""
+        return self._ttl_enabled and self._is_expired(item)
 
     def _split(self, full_key: str) -> tuple[str, str]:
         """Split a full key into (partition key, sort key)."""
