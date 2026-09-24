@@ -127,7 +127,8 @@ return items whose expiry has passed but which DynamoDB has not yet physically d
 `search()` gives an agent semantic long-term memory over the same table: write each memory with its embedding, then
 query by meaning. It is an optional, feature-detected part of the `Storage` contract (`if (storage.search) { … }`).
 This store searches pre-computed embedding vectors and does not embed text: pass a `SearchQuery` with a `vector`, as
-every example does. A plain-string query is rejected with a `StorageError` at runtime, so a text-search consumer that
+every example does. A plain-string query is rejected with a `StorageError` at runtime unless a `searchStrategy` is
+configured (see [Use with SDK consumers](#use-with-sdk-consumers-searchstrategy)), so a text-search consumer that
 expects the backend to embed for it must wrap this store with an embedding bridge rather than wiring it in directly.
 On DynamoDB the search runs against the **native vector
 index**, so nearest-neighbour scoring happens _in the database_ -- no second vector store, no ETL -- and because the index
@@ -189,7 +190,8 @@ The adapter is purely an override: with none configured, `search()` issues the n
 `LexicalIndex` is an opt-in index for finding stored documents by the words they contain (`search`) or by an exact
 identifier such as an error code (`lookup`). It owns the write path of indexed documents: `upsert` writes the document
 to the storage table and its index entries (a manifest plus one posting per term and identifier) to a separate index
-table in one `TransactWriteItems` call. `DynamoDBStorage.search()` and the byte `Storage` contract are unchanged.
+table in one `TransactWriteItems` call. The byte `Storage` contract is unchanged, and `DynamoDBStorage.search()` only
+gains an opt-in text path for SDK consumers ([below](#use-with-sdk-consumers-searchstrategy)).
 _Preview_ means the API and the on-table layout (`lexical-v1`, `LEXICAL_TOKENIZER_VERSION`) may change before it is
 marked stable; the design is open for maintainer review.
 
@@ -329,25 +331,62 @@ overwritten, foreign or expired document, and optionally re-puts the postings of
 concurrently are skipped. Pass each `RepairReport.cursor` to the next call until it is `null`. Manifests never expire,
 so run `repair` periodically when documents use TTL.
 
+### Use with SDK consumers (`searchStrategy`)
+
+SDK consumers that only know the byte `Storage` API, such as the SDK `FileMemoryStore` (it calls `write(key, bytes)`
+and later `search('natural language')`), use the index through `LexicalSearchStrategy`, configured as the storage's
+`searchStrategy` like the SDK's own backends:
+
+```ts
+import { FileMemoryStore } from '@strands-agents/sdk/vended-memory-stores/file-memory-store'
+import { DynamoDBStorage, LexicalSearchStrategy } from 'strands-dynamodb-storage'
+
+const storage = new DynamoDBStorage('agent-data', {
+  region: 'us-east-1',
+  searchStrategy: new LexicalSearchStrategy({
+    indexTableName: 'agent-lexical-index',
+    extract: (_key, data) => ({ text: new TextDecoder().decode(data) }), // required; return null to skip a value
+    topK: 10, // default; also includeValues (default true) and limits
+  }),
+})
+const memory = new FileMemoryStore({ name: 'agent-memory', storage })
+await memory.add('# User preferences\nPrefers dark mode')
+const entries = await memory.search('dark mode')
+```
+
+- **The extractor is explicit.** Stored bytes are never decoded implicitly: `extract(key, data)` decides which text and
+  `identifiers` a value carries. Returning `null` leaves the value unindexed; a previously indexed version of the key
+  is then excluded at read time and cleaned up by `repair`.
+- **One extra write, at-least-once.** After every successful `write()`, the strategy rewrites the item together with
+  its postings through `upsert`, keeping the write's `vector`, `metadata` and TTL. If indexing fails, the value stays
+  stored but unsearchable and `write()` throws `StorageError("Wrote '<key>' but indexing failed")` with the cause
+  attached; retrying the write re-indexes it. `upsert` remains the single-write, atomic path.
+- **Same limits as `upsert`.** Extracted text is never truncated: more than `maxPostingsPerDocument` (49) distinct terms
+  and identifiers, or a value that would need S3 offload, fails indexing as above.
+- **Tolerant queries.** A plain-string `search()` skips terms above `maxTermBytes`, uses only the first
+  `maxQueryTerms` (16) distinct terms of a long query, and returns `[]` when no term remains. Results are
+  `{ key, score, data? }`; truncation flags are dropped. A `SearchQuery` still runs the native vector search.
+- Namespaced views (`FileMemoryStore` uses one) inherit the strategy, and each is searched in its own lexical scope.
+
 ### Not supported
 
 S3 offload for indexed documents (a value that would offload is rejected); global tables or multi-Region use
 (transactions are atomic only in the Region where they run); online backfill (`repair` cannot re-tokenize because
-source text is not stored, so a tokenizer change requires re-upserting); SDK `SearchStrategy` integration; hybrid
-vector + lexical ranking (RRF, proposed as the next increment); BM25 or other corpus-statistics scoring; phrase or
-substring search.
+source text is not stored, so a tokenizer change requires re-upserting); hybrid vector + lexical ranking (RRF, proposed
+as the next increment); BM25 or other corpus-statistics scoring; phrase or substring search.
 
 ## Configuration reference
 
-| Option                               | Purpose                                                                  |
-| ------------------------------------ | ------------------------------------------------------------------------ |
-| `region` / `client`                  | AWS region, or a pre-built `DynamoDBDocumentClient` (mutually exclusive) |
-| `prefix`                             | Key prefix prepended to every key (a namespace within the table)         |
-| `s3Bucket` / `s3Prefix` / `s3Client` | S3 offload target for large values                                       |
-| `compression`                        | `'gzip'` \| `'none'` (default `'none'`)                                  |
-| `ttlSeconds` / `ttlAttribute`        | TTL duration + attribute name (default `expireAt`)                       |
-| `indexName` / `vectorAttribute`      | Vector index + embedding attribute (default `vector_index` / `vector`)   |
-| `vectorSearch`                       | Adapter that performs the native vector search                           |
+| Option                               | Purpose                                                                              |
+| ------------------------------------ | ------------------------------------------------------------------------------------ |
+| `region` / `client`                  | AWS region, or a pre-built `DynamoDBDocumentClient` (mutually exclusive)             |
+| `prefix`                             | Key prefix prepended to every key (a namespace within the table)                     |
+| `s3Bucket` / `s3Prefix` / `s3Client` | S3 offload target for large values                                                   |
+| `compression`                        | `'gzip'` \| `'none'` (default `'none'`)                                              |
+| `ttlSeconds` / `ttlAttribute`        | TTL duration + attribute name (default `expireAt`)                                   |
+| `indexName` / `vectorAttribute`      | Vector index + embedding attribute (default `vector_index` / `vector`)               |
+| `vectorSearch`                       | Adapter that performs the native vector search                                       |
+| `searchStrategy`                     | Answers plain-string `search()` and indexes each write, e.g. `LexicalSearchStrategy` |
 
 ## Minimal IAM
 

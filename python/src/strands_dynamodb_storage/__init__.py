@@ -6,7 +6,8 @@
 Implements the SDK's unified byte ``Storage`` interface, so one DynamoDB-backed
 instance persists any subsystem's data (Session Manager, Memory Manager, offloader,
 transcripts) — with optional S3 offload, gzip compression, TTL, and native vector search.
-An opt-in :class:`LexicalIndex` (preview) adds term and exact-identifier retrieval.
+An opt-in :class:`LexicalIndex` (preview) adds term and exact-identifier retrieval, and
+:class:`LexicalSearchStrategy` exposes it to SDK consumers through ``search_strategy``.
 """
 
 from .dynamodb_storage import (
@@ -27,6 +28,7 @@ from .lexical_index import (
     RevisionConflictError,
     SearchableDocument,
 )
+from .lexical_search_strategy import LexicalSearchStrategy, SearchableText, SearchableTextExtractor
 from .lexical_terms import LEXICAL_TOKENIZER_VERSION
 
 __all__ = [
@@ -44,5 +46,8 @@ __all__ = [
     "LexicalSearchResponse",
     "RepairReport",
     "RevisionConflictError",
+    "LexicalSearchStrategy",
+    "SearchableText",
+    "SearchableTextExtractor",
     "LEXICAL_TOKENIZER_VERSION",
 ]

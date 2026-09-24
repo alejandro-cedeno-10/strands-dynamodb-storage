@@ -11,9 +11,9 @@ import contextlib
 import gzip
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional, Protocol, Union
 
 from strands.types.exceptions import StorageError
 
@@ -86,6 +86,35 @@ class SearchResult:
     score: float
     data: Optional[bytes] = None
     metadata: Optional[dict[str, Any]] = None
+
+
+class _StrategyMatch(Protocol):
+    """Read-only shape of one search-strategy result; the SDK's ``StorageSearchResult`` satisfies it."""
+
+    @property
+    def key(self) -> str: ...
+
+    @property
+    def score(self) -> float: ...
+
+    @property
+    def data(self) -> Optional[bytes]: ...
+
+
+class StringSearchStrategy(Protocol):
+    """Structural shape of the SDK ``SearchStrategy`` as :class:`DynamoDBStorage` uses it.
+
+    Declared here instead of importing the SDK type because the supported SDK floor predates
+    it. :class:`LexicalSearchStrategy` implements it.
+    """
+
+    async def index(self, storage: DynamoDBStorage, key: str, data: bytes, **kwargs: Any) -> None:
+        """Index a value that ``storage`` just wrote; ``kwargs`` carry ``vector``, ``metadata`` and ``ttl_seconds``."""
+        ...
+
+    async def search(self, storage: DynamoDBStorage, query: str, **kwargs: Any) -> Sequence[_StrategyMatch]:
+        """Rank the values stored in ``storage`` for a natural-language ``query``, best first."""
+        ...
 
 
 def _clean_prefix(prefix: str) -> str:
@@ -238,6 +267,7 @@ class DynamoDBStorage:
         index_name: str = "vector_index",
         vector_attribute: str = "vector",
         vector_search: Optional[VectorSearchAdapter] = None,
+        search_strategy: Optional[StringSearchStrategy] = None,
         boto_session: Any = None,
         boto_client_config: Any = None,
     ) -> None:
@@ -261,6 +291,9 @@ class DynamoDBStorage:
             index_name: Vector index name (for ``search``).
             vector_attribute: Item attribute holding the embedding vector.
             vector_search: Adapter performing the native vector search.
+            search_strategy: Strategy answering plain-string :meth:`search` queries, such as
+                :class:`LexicalSearchStrategy`. As in the SDK's storage backends, every successful
+                :meth:`write` is then passed to its ``index`` hook. Namespaced views share it.
             boto_session: Pre-configured boto3 session. Cannot be combined with region_name.
             boto_client_config: Botocore Config for the created clients.
 
@@ -284,6 +317,7 @@ class DynamoDBStorage:
         self._index_name = index_name
         self._vector_attribute = vector_attribute
         self._vector_search = vector_search
+        self._search_strategy = search_strategy
         self._boto_session = boto_session
         self._boto_client_config = boto_client_config
 
@@ -300,11 +334,13 @@ class DynamoDBStorage:
 
         Values above the item-size limit offload to S3 when ``s3_bucket`` is set.
         An optional ``vector`` (kept inline for the native index) and ``metadata``
-        enable :meth:`search`.
+        enable :meth:`search`. With a ``search_strategy``, the stored value and these
+        options are then passed to the strategy's ``index`` hook.
 
         Raises:
             StorageError: If the key is invalid, the value is oversized with no S3
-                bucket configured, or the write fails.
+                bucket configured, or the write fails; or, with the value already
+                stored, ``"Wrote '<key>' but indexing failed"`` if the hook fails.
         """
         normalized = normalize_key(key)
         full = f"{self._prefix}{normalized}"
@@ -338,6 +374,7 @@ class DynamoDBStorage:
             raise
         except Exception as error:
             raise StorageError(f"Failed to write '{normalized}' to DynamoDB table '{self._table_name}'") from error
+        await self._index_written(normalized, data, vector=vector, metadata=metadata, ttl_seconds=ttl_seconds)
 
     async def read(self, key: str) -> Optional[bytes]:
         """Retrieve the bytes stored under ``key``, or ``None`` if absent.
@@ -447,19 +484,25 @@ class DynamoDBStorage:
         kwargs["ttl_attribute"] = self._ttl_attribute
         if self._vector_search is not None:
             kwargs["vector_search"] = self._vector_search
+        if self._search_strategy is not None:
+            kwargs["search_strategy"] = self._search_strategy
         if self._boto_session is not None:
             kwargs["boto_session"] = self._boto_session
         if self._boto_client_config is not None:
             kwargs["boto_client_config"] = self._boto_client_config
         return DynamoDBStorage(self._table_name, **kwargs)
 
-    async def search(self, query: SearchQuery) -> builtins.list[SearchResult]:
+    async def search(self, query: Union[SearchQuery, str]) -> builtins.list[SearchResult]:
         """Nearest-neighbour vector search over items written with a ``vector``.
 
         Optional part of the ``Storage`` contract — consumers feature-detect
         (``hasattr(storage, "search")``) and fall back to client-side KNN when absent.
         Calls DynamoDB ``SearchVectors`` natively (requires boto3 >= 1.43.64); a
         ``vector_search`` adapter, when configured, overrides the native call.
+
+        A plain-string ``query`` is delegated to the configured ``search_strategy`` and its
+        matches are returned as :class:`SearchResult` with ``key``, ``score`` and ``data``
+        (``metadata`` is ``None``); a :class:`SearchQuery` always takes the vector path.
 
         The score is the raw ``Score`` from the vector index and its direction
         depends on the index's distance function: for COSINE and EUCLIDEAN lower
@@ -471,8 +514,11 @@ class DynamoDBStorage:
         but which DynamoDB has not yet physically deleted.
 
         Raises:
-            StorageError: If the search fails or ``top_k`` is out of range.
+            StorageError: If the search fails, ``top_k`` is out of range, or ``query`` is a
+                plain string and no ``search_strategy`` is configured.
         """
+        if isinstance(query, str):
+            return await self._search_text(query)
         if query.pk is not None:
             self._assert_pk_in_scope(query.pk)
         try:
@@ -511,6 +557,56 @@ class DynamoDBStorage:
             raise
         except Exception as error:
             raise StorageError(f"Failed to search DynamoDB table '{self._table_name}'") from error
+
+    async def _search_text(self, query: str) -> builtins.list[SearchResult]:
+        """Delegate a plain-string query to the search strategy, as the SDK's storage backends do.
+
+        Matches keep the strategy's ``key``, ``score`` and ``data``; ``metadata`` is always ``None``.
+        Errors other than ``StorageError`` are wrapped, like every other failure of this backend.
+
+        Raises:
+            StorageError: If no search strategy is configured, or the strategy fails.
+        """
+        if self._search_strategy is None:
+            raise StorageError(
+                "DynamoDBStorage.search requires a SearchQuery with a pre-computed embedding vector. "
+                "Plain-string queries are not supported without a search_strategy: embed the text first "
+                "and pass SearchQuery(vector=..., top_k=...), or configure a search_strategy "
+                "(for example LexicalSearchStrategy)."
+            )
+        try:
+            matches = await self._search_strategy.search(self, query)
+        except StorageError:
+            raise
+        except Exception as error:
+            raise StorageError(f"Failed to search DynamoDB table '{self._table_name}'") from error
+        return [SearchResult(key=match.key, score=match.score, data=match.data) for match in matches]
+
+    async def _index_written(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        vector: Optional[builtins.list[float]],
+        metadata: Optional[dict[str, _MetaValue]],
+        ttl_seconds: Optional[int],
+    ) -> None:
+        """Pass a completed write to the search strategy's ``index`` hook (a no-op without a strategy).
+
+        ``key`` is the normalized key and the write's ``vector``, ``metadata`` and ``ttl_seconds``
+        are forwarded, so an indexing strategy that re-stores the value keeps them. Any failure,
+        ``StorageError`` included, becomes ``StorageError("Wrote '<key>' but indexing failed")``
+        chaining the cause (the SDK's wording): the value is already stored, and the caller must
+        be able to tell that apart from a failed write.
+        """
+        if self._search_strategy is None:
+            return
+        try:
+            await self._search_strategy.index(
+                self, key, data, vector=vector, metadata=metadata, ttl_seconds=ttl_seconds
+            )
+        except Exception as error:
+            raise StorageError(f"Wrote '{key}' but indexing failed") from error
 
     async def _native_vector_search(self, query: SearchQuery) -> builtins.list[dict[str, Any]]:
         """Issue DynamoDB ``SearchVectors`` directly (GA path, no adapter).

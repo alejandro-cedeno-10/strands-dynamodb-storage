@@ -818,16 +818,40 @@ class LexicalIndex:
 
     async def _search(self, query: LexicalQuery) -> LexicalSearchResponse:
         _require_top_k(query.top_k)
-        terms = self._query_terms(query.text)
-        return await self._retrieve(
-            _Retrieval(
-                partitions=[term_posting_pk(self.scope, term) for term in terms],
-                top_k=query.top_k,
-                filter=query.filter,
-                include_values=query.include_values,
-                required_matches=len(terms) if query.require_all_terms else 1,
-            )
+        return await self._search_terms(
+            self._query_terms(query.text),
+            top_k=query.top_k,
+            include_values=query.include_values,
+            filter=query.filter,
+            require_all_terms=query.require_all_terms,
         )
+
+    async def _search_terms(
+        self,
+        terms: Sequence[str],
+        *,
+        top_k: int,
+        include_values: bool,
+        filter: Optional[dict[str, _MetaValue]] = None,
+        require_all_terms: bool = False,
+    ) -> LexicalSearchResponse:
+        """Internal: rank documents by already tokenized query ``terms``; shared by :meth:`search` and the SDK strategy.
+
+        Callers validate first: ``top_k`` within 1..100, and ``terms`` distinct, non-empty and within
+        ``max_term_bytes`` and ``max_query_terms`` (:meth:`search` rejects a query that is not, the
+        strategy trims it). Unexpected errors are wrapped as in :meth:`search`.
+
+        Raises:
+            StorageError: If a partition key is oversized, keys stay unprocessed, or DynamoDB fails.
+        """
+        retrieval = _Retrieval(
+            partitions=[term_posting_pk(self.scope, term) for term in terms],
+            top_k=top_k,
+            filter=filter,
+            include_values=include_values,
+            required_matches=len(terms) if require_all_terms else 1,
+        )
+        return await self._guard("search", None, lambda: self._retrieve(retrieval))
 
     def _query_terms(self, text: str) -> list[str]:
         terms = text_terms(text)

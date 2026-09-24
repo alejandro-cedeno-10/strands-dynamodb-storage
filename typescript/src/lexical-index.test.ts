@@ -1546,6 +1546,7 @@ describe('DynamoDBStorage — document item port', () => {
       'DynamoDBStorage',
       'LEXICAL_TOKENIZER_VERSION',
       'LexicalIndex',
+      'LexicalSearchStrategy',
       'RevisionConflictError',
     ])
   })
