@@ -10,6 +10,10 @@
  * subsystem that persists bytes — with optional S3 offload for values above the
  * DynamoDB item limit and an optional native vector-search hook.
  *
+ * Also ships {@link LexicalIndex} (preview), an opt-in lexical document index: it writes documents
+ * together with their term and exact-identifier postings (kept in a separate, user-provisioned index
+ * table) in one transaction, and retrieves them by term overlap or exact identifier.
+ *
  * @example
  * ```typescript
  * import { Agent, SessionManager } from '@strands-agents/sdk'
@@ -30,3 +34,17 @@ export type {
   SearchResult,
   VectorSearchAdapter,
 } from './dynamodb-storage.js'
+export { LexicalIndex, DEFAULT_LEXICAL_INDEX_LIMITS, RevisionConflictError } from './lexical-index.js'
+export type {
+  SearchableDocument,
+  LexicalIndexLimits,
+  LexicalIndexConfig,
+  LexicalQuery,
+  IdentifierQuery,
+  LexicalSearchResult,
+  LexicalSearchResponse,
+  RepairReport,
+  RepairOptions,
+  RevisionOptions,
+} from './lexical-index.js'
+export { LEXICAL_TOKENIZER_VERSION } from './lexical-terms.js'
