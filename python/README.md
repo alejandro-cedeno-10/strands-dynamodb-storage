@@ -66,19 +66,14 @@ every search is scoped to the caller's key space -- one tenant's memories can ne
 in another's results. Creating the table with a vector index (and the IAM permissions needed)
 is covered in the repository README's [Provisioning and permissions](../#provisioning-and-permissions).
 
-`pk` is required whenever the index's `SearchSchema` declares a HASH
-element (the provisioning guide's setup does) and must be omitted when it doesn't.
-
-When TTL is enabled, `search()` checks each in-scope candidate with a strongly consistent
-`GetItem` against the base table, projecting only the partition key and configured TTL attribute.
-This works even when the vector index does not project TTL or a custom adapter returns stale payloads.
-Expired and missing items are omitted before fetching values from S3. Items without TTL remain eligible.
-This adds one base-table read per in-scope candidate (and requires `dynamodb:GetItem` permission);
-projection reduces response bytes, not read-capacity charges. Including values also performs the normal
-value read for each surviving candidate. TTL-disabled searches keep their existing read behavior.
-Filtering preserves ranking but can return fewer than the requested result count, including zero;
-no extra vector search is issued to refill results. This is a per-item expiry check, not a snapshot:
-concurrent updates and expiration after validation remain possible, and scores/metadata are eventually consistent.
+Two behaviours to know: `pk` is required whenever the index's `SearchSchema` declares a HASH
+element (the provisioning guide's setup does) and must be omitted when it doesn't. And with TTL
+enabled, `search()` drops matches whose expiry has passed, reading the TTL attribute from the vector
+index at no extra read cost. That needs the index to project it (`ALL`, or `INCLUDE` listing the TTL
+attribute); with a narrower projection matches are returned unfiltered. A `vector_search` adapter opts
+in by returning `expire_at` (epoch seconds) on each match. Expired matches are not back-filled, so a
+search can return fewer than `top_k` results, and an item whose TTL was just renewed can be briefly
+hidden until the index catches up with the write.
 
 ```python
 from strands_dynamodb_storage import DynamoDBStorage, SearchQuery

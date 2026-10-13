@@ -40,7 +40,9 @@ _FILTER_OVERFETCH = 10
 _MetaValue = Union[str, int, float, bool]
 
 # Optional override for the native vector search call (DynamoDB SearchVectors).
-# Receives a params dict and returns match dicts: {"key", "score", "metadata"?}.
+# Receives a params dict and returns match dicts: {"key", "score", "metadata"?,
+# "expire_at"?}. An adapter opts in to TTL filtering by returning the item's
+# epoch-seconds expiry as "expire_at".
 VectorSearchAdapter = Callable[[dict[str, Any]], Awaitable[builtins.list[dict[str, Any]]]]
 
 
@@ -135,7 +137,7 @@ class DynamoDBStorage:
 
     Values above the 400 KB item limit are offloaded to S3 when ``s3_bucket`` is set;
     a small pointer item stays in DynamoDB. Optional transparent gzip compression,
-    optional DynamoDB-native TTL (with read/list/search filtering of expired items), and an
+    optional DynamoDB-native TTL (with read/list filtering of expired items), and an
     optional native vector ``search`` complete the feature set. boto3 is imported
     lazily, so applications that never construct this class don't pay the import cost.
 
@@ -421,11 +423,15 @@ class DynamoDBStorage:
         depends on the index's distance function: for COSINE and EUCLIDEAN lower
         is closer; for DOT_PRODUCT higher is more similar. Results are returned
         in the service's most-similar-first order. Like a global secondary
-        index, the vector index is eventually consistent. When TTL is enabled,
-        each in-scope candidate is checked with a strongly consistent base-table
-        read before returning it. Missing and expired items are omitted; this
-        can return fewer than ``top_k`` results. With ``include_values``, each
-        surviving candidate is also read through ``read``.
+        index, the vector index is eventually consistent.
+
+        With TTL enabled, matches whose TTL attribute has passed are dropped, the
+        same check ``read`` applies, without any extra reads: the native path
+        projects the TTL attribute from the vector index, and an adapter opts in
+        by returning ``expire_at`` on each match. A match that carries no expiry
+        (an index that does not project the TTL attribute, or an adapter that
+        does not return it) is kept. Expired matches are not back-filled, so a
+        search can return fewer than ``top_k`` results.
 
         Raises:
             StorageError: If the search fails or ``top_k`` is out of range.
@@ -456,13 +462,14 @@ class DynamoDBStorage:
                 key = self._strip_prefix(match["key"])
                 if key is None:
                     continue
-                if self._ttl_enabled and not await self._search_item_is_live(key):
+                if self._ttl_enabled and self._has_passed(match.get("expire_at")):
                     continue
                 data = None
                 if query.include_values:
-                    data = await self._search_result_value(key, match)
-                    if self._ttl_enabled and data is None:
-                        continue
+                    # The native path decodes the projected payload into the match;
+                    # offloaded values, narrow projections, and adapter matches fall
+                    # back to a point read (which also fetches from S3 and decompresses).
+                    data = match["data"] if "data" in match else await self.read(key)
                 results.append(SearchResult(key=key, score=match["score"], data=data, metadata=match.get("metadata")))
             return results
         except StorageError:
@@ -482,6 +489,8 @@ class DynamoDBStorage:
           filtering doesn't silently drop results below ``top_k``. A filtered
           search can still return fewer than ``top_k`` matches once the cap
           truncates the over-fetch.
+        * With TTL enabled, the TTL attribute is projected and expired matches
+          are dropped before counting towards ``top_k``.
         """
         if query.top_k < 1 or query.top_k > _MAX_TOP_K:
             raise StorageError(
@@ -495,16 +504,18 @@ class DynamoDBStorage:
 
         # Project only what the response is for: keys (to rebuild the storage key)
         # and metadata (results + client-side filter), adding the payload and its
-        # s3/gzip flags only when the caller asked for values and TTL is off (see
-        # _search_result_value). Everything else the index projects (ProjectionType
-        # ALL projects the whole item) is billed response bytes for data nobody
-        # reads. Every name is aliased: `data` is a DynamoDB reserved word.
-        reuse_projected_values = query.include_values and not self._ttl_enabled
+        # s3/gzip flags only when the caller asked for values. Everything else the
+        # index projects (ProjectionType ALL projects the whole item) is billed
+        # response bytes for data nobody reads. Every name is aliased: `data` is a
+        # DynamoDB reserved word.
         names: dict[str, str] = {"#pk": _PK, "#sk": _SK, "#m": _META_ATTR}
         projection = "#pk, #sk, #m"
-        if reuse_projected_values:
+        if query.include_values:
             names.update({"#d": _DATA_ATTR, "#s3": _S3_ATTR, "#z": _Z_ATTR})
             projection += ", #d, #s3, #z"
+        if self._ttl_enabled:
+            names["#ttl"] = self._ttl_attribute
+            projection += ", #ttl"
         request: dict[str, Any] = {
             "TableName": self._table_name,
             "IndexName": self._index_name,
@@ -526,13 +537,15 @@ class DynamoDBStorage:
             pk = item[_PK]["S"]
             sk = item.get(_SK, {}).get("S", "")
             full_key = pk if sk in ("", _SENTINEL_SK) else f"{pk}/{sk}"
+            if self._ttl_enabled and self._is_expired(item):
+                continue
             metadata = _unmarshal_meta(item.get(_META_ATTR))
             if query.filter is not None and not self._matches_search_filter(metadata, query.filter):
                 continue
             match: dict[str, Any] = {"key": full_key, "score": float(result["Score"])}
             if metadata is not None:
                 match["metadata"] = metadata
-            if reuse_projected_values and not item.get(_S3_ATTR, {}).get("BOOL"):
+            if query.include_values and not item.get(_S3_ATTR, {}).get("BOOL"):
                 blob = item.get(_DATA_ATTR, {}).get("B")
                 if blob is not None:
                     raw = bytes(blob)
@@ -541,38 +554,6 @@ class DynamoDBStorage:
             if len(matches) >= query.top_k:
                 break
         return matches
-
-    async def _search_item_is_live(self, key: str) -> bool:
-        """True when the base-table item exists and its TTL has not passed.
-
-        Strongly consistent so a stale index or adapter cannot resurrect an expired or deleted item;
-        ``#pk`` is projected so a live item without a TTL attribute still returns a non-empty ``Item``.
-        Read errors propagate to :meth:`search`.
-        """
-        pk, sk = self._split(f"{self._prefix}{normalize_key(key)}")
-        response = await asyncio.to_thread(
-            self._get_client().get_item,
-            TableName=self._table_name,
-            Key={_PK: {"S": pk}, _SK: {"S": sk}},
-            ConsistentRead=True,
-            ProjectionExpression="#pk, #ttl",
-            ExpressionAttributeNames={"#pk": _PK, "#ttl": self._ttl_attribute},
-        )
-        item = response.get("Item")
-        return bool(item) and not self._is_expired(item)
-
-    async def _search_result_value(self, key: str, match: dict[str, Any]) -> Optional[bytes]:
-        """Value for a search match: the payload the native path decoded, else a point read.
-
-        Offloaded values, narrow projections and adapter matches carry no ``data`` and fall back to
-        :meth:`read`, which fetches from S3 and decompresses. With TTL enabled the projected payload is
-        never reused because the index or adapter may be stale; ``read`` rechecks expiry before any S3
-        fetch, so ``None`` then means the item expired or was deleted after its liveness check.
-        """
-        if "data" in match and not self._ttl_enabled:
-            projected: Optional[bytes] = match["data"]
-            return projected
-        return await self.read(key)
 
     @staticmethod
     def _matches_search_filter(metadata: Optional[dict[str, Any]], filter_dict: dict[str, _MetaValue]) -> bool:
@@ -599,12 +580,16 @@ class DynamoDBStorage:
         cannot parse is treated as not expired -- filtering is this method's job,
         not validating other writers' data.
         """
-        raw = item.get(self._ttl_attribute, {}).get("N")
-        if raw is None:
+        return self._has_passed(item.get(self._ttl_attribute, {}).get("N"))
+
+    @staticmethod
+    def _has_passed(epoch_seconds: Any) -> bool:
+        """True when ``epoch_seconds`` parses as a number at or before now; False otherwise."""
+        if epoch_seconds is None or isinstance(epoch_seconds, bool):
             return False
         try:
-            return float(raw) <= time.time()
-        except ValueError:
+            return float(epoch_seconds) <= time.time()
+        except (TypeError, ValueError):
             return False
 
     def _assert_pk_in_scope(self, pk: str) -> None:

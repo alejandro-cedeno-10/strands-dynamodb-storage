@@ -68,7 +68,8 @@ export interface SearchResult {
 /**
  * Optional override for the vector-search call. By default {@link DynamoDBStorage.search}
  * issues DynamoDB `SearchVectors` natively (requires `@aws-sdk/client-dynamodb` >= 3.1103.0);
- * supply an adapter to replace the call (e.g. for testing or custom routing).
+ * supply an adapter to replace the call (e.g. for testing or custom routing). An adapter
+ * opts in to TTL filtering by returning each item's epoch-seconds expiry as `expireAt`.
  */
 export type VectorSearchAdapter = (params: {
   tableName: string
@@ -78,7 +79,7 @@ export type VectorSearchAdapter = (params: {
   vector: number[]
   topK: number
   filter?: Record<string, string | number | boolean>
-}) => Promise<Array<{ key: string; score: number; metadata?: Record<string, unknown> }>>
+}) => Promise<Array<{ key: string; score: number; metadata?: Record<string, unknown>; expireAt?: number }>>
 
 /** Configuration for {@link DynamoDBStorage}. */
 export interface DynamoDBStorageConfig {
@@ -423,10 +424,14 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
    * direction depends on the index's distance function: for COSINE and EUCLIDEAN
    * lower is closer; for DOT_PRODUCT higher is more similar. Results arrive in
    * the service's most-similar-first order. Like a global secondary index, the
-   * vector index is eventually consistent. When TTL is enabled, each in-scope
-   * candidate is checked with a strongly consistent base-table read. Missing and
-   * expired items are omitted, so fewer than `topK` results may be returned.
-   * With `includeValues`, each surviving candidate is also read through `read`.
+   * vector index is eventually consistent.
+   *
+   * With TTL enabled, matches whose TTL attribute has passed are dropped, the same
+   * check `read` applies, without any extra reads: the native path projects the TTL
+   * attribute from the vector index, and an adapter opts in by returning `expireAt`
+   * on each match. A match that carries no expiry (an index that does not project the
+   * TTL attribute, or an adapter that does not return it) is kept. Expired matches are
+   * not back-filled, so a search can return fewer than `topK` results.
    *
    * @throws {@link StorageError} if the search fails, `topK` is out of range, or the
    *   query is a plain string — this store searches pre-computed embedding vectors and
@@ -443,8 +448,13 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
     }
     if (query.pk !== undefined) this._assertPkInScope(query.pk)
     try {
-      const matches: Array<{ key: string; score: number; metadata?: Record<string, unknown>; data?: Uint8Array }> = this
-        ._vectorSearch
+      const matches: Array<{
+        key: string
+        score: number
+        metadata?: Record<string, unknown>
+        data?: Uint8Array
+        expireAt?: number
+      }> = this._vectorSearch
         ? await this._vectorSearch({
             tableName: this._tableName,
             indexName: this._indexName,
@@ -462,12 +472,14 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
         // foreign key would otherwise be handed back looking like one of ours.
         const key = this._stripPrefix(match.key)
         if (key === null) continue
-        if (this._ttlEnabled && !(await this._searchItemIsLive(key))) continue
+        if (this._ttlEnabled && this._hasPassed(match.expireAt)) continue
         const result: SearchResult = { key, score: match.score }
         if (match.metadata !== undefined) result.metadata = match.metadata
         if (query.includeValues) {
-          const data = await this._searchResultValue(key, match)
-          if (this._ttlEnabled && data === null) continue
+          // The native path decodes the projected payload into the match; offloaded
+          // values, narrow projections, and adapter matches fall back to a point
+          // read (which also fetches from S3 and decompresses).
+          const data = match.data !== undefined ? match.data : await this.read(key)
           if (data) result.data = data
         }
         results.push(result)
@@ -487,7 +499,8 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
    * after the search, with the request over-fetching (capped at the service
    * TopK limit of 100) so filtering doesn't silently drop results below
    * `topK`; a filtered search can still return fewer than `topK` matches once
-   * the cap truncates the over-fetch.
+   * the cap truncates the over-fetch. With TTL enabled, the TTL attribute is
+   * projected and expired matches are dropped before counting towards `topK`.
    */
   private async _nativeVectorSearch(
     query: SearchQuery
@@ -507,16 +520,19 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
     const client = await this._getClient()
     // Project only what the response is for: keys (to rebuild the storage key)
     // and metadata (results + client-side filter), adding the payload and its
-    // s3/gzip flags only when the caller asked for values and TTL is off (see
-    // _searchResultValue). Everything else the index projects (ProjectionType
-    // ALL projects the whole item) is billed response bytes for data nobody
-    // reads. Every name is aliased: `data` is a DynamoDB reserved word.
-    const reuseProjectedValues = query.includeValues && !this._ttlEnabled
+    // s3/gzip flags only when the caller asked for values. Everything else the
+    // index projects (ProjectionType ALL projects the whole item) is billed
+    // response bytes for data nobody reads. Every name is aliased: `data` is a
+    // DynamoDB reserved word.
     const names: Record<string, string> = { '#pk': PK, '#sk': SK, '#m': META_ATTR }
     let projection = '#pk, #sk, #m'
-    if (reuseProjectedValues) {
+    if (query.includeValues) {
       Object.assign(names, { '#d': DATA_ATTR, '#s3': S3_ATTR, '#z': Z_ATTR })
       projection += ', #d, #s3, #z'
+    }
+    if (this._ttlEnabled) {
+      names['#ttl'] = this._ttlAttribute
+      projection += ', #ttl'
     }
     const response = await client.send(
       new SearchVectorsCommand({
@@ -540,6 +556,7 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
       const pk = item[PK] as string
       const sk = (item[SK] as string | undefined) ?? ''
       const fullKey = sk === '' || sk === '\u0000' ? pk : `${pk}/${sk}`
+      if (this._ttlEnabled && this._isExpired(item)) continue
       const metadata = item[META_ATTR] as Record<string, unknown> | undefined
       if (query.filter !== undefined && !DynamoDBStorage._matchesSearchFilter(metadata, query.filter)) continue
       const match: { key: string; score: number; metadata?: Record<string, unknown>; data?: Uint8Array } = {
@@ -547,7 +564,7 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
         score: result.Score,
         ...(metadata !== undefined && { metadata }),
       }
-      if (reuseProjectedValues && item[S3_ATTR] !== true) {
+      if (query.includeValues && item[S3_ATTR] !== true) {
         const stored = item[DATA_ATTR] as Uint8Array | undefined
         if (stored !== undefined) {
           const raw = new Uint8Array(stored)
@@ -558,41 +575,6 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
       if (matches.length >= query.topK) break
     }
     return matches
-  }
-
-  /**
-   * True when the base-table item exists and its TTL has not passed.
-   *
-   * Strongly consistent so a stale index or adapter cannot resurrect an expired or deleted item;
-   * `#pk` is projected so a live item without a TTL attribute still returns a non-empty `Item`.
-   * Read errors propagate to `search`.
-   */
-  private async _searchItemIsLive(key: string): Promise<boolean> {
-    const { pk, sk } = this._split(`${this._prefix}${normalizeKey(key)}`)
-    const { GetCommand } = await import('@aws-sdk/lib-dynamodb')
-    const client = await this._getClient()
-    const response = await client.send(
-      new GetCommand({
-        TableName: this._tableName,
-        Key: { [PK]: pk, [SK]: sk },
-        ConsistentRead: true,
-        ProjectionExpression: '#pk, #ttl',
-        ExpressionAttributeNames: { '#pk': PK, '#ttl': this._ttlAttribute },
-      })
-    )
-    return response.Item !== undefined && !this._isExpired(response.Item)
-  }
-
-  /**
-   * Value for a search match: the payload the native path decoded, else a point read.
-   *
-   * Offloaded values, narrow projections and adapter matches carry no `data` and fall back to
-   * `read`, which fetches from S3 and decompresses. With TTL enabled the projected payload is
-   * never reused because the index or adapter may be stale; `read` rechecks expiry before any S3
-   * fetch, so `null` then means the item expired or was deleted after its liveness check.
-   */
-  private async _searchResultValue(key: string, match: { data?: Uint8Array }): Promise<Uint8Array | null> {
-    return match.data !== undefined && !this._ttlEnabled ? match.data : this.read(key)
   }
 
   /** Exact-equality match of every filter entry against item metadata. */
@@ -622,8 +604,12 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
 
   /** True when the item carries a TTL attribute whose epoch-seconds value has passed. */
   private _isExpired(item: Record<string, unknown>): boolean {
-    const exp = item[this._ttlAttribute]
-    return typeof exp === 'number' && exp <= Math.floor(Date.now() / 1000)
+    return this._hasPassed(item[this._ttlAttribute])
+  }
+
+  /** True when `epochSeconds` is a number at or before now. */
+  private _hasPassed(epochSeconds: unknown): boolean {
+    return typeof epochSeconds === 'number' && epochSeconds <= Math.floor(Date.now() / 1000)
   }
 
   /**

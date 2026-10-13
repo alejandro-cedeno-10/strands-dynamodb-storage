@@ -643,6 +643,71 @@ async def test_search_native_drops_foreign_namespace_matches(aws):
     assert results == []
 
 
+def _ttl_hit(sk: str, score: float, expire_at=None, attribute: str = "expireAt") -> dict:
+    item = {"pk": {"S": "tenant/a"}, "sk": {"S": sk}}
+    if expire_at is not None:
+        item[attribute] = {"N": str(expire_at)}
+    return {"Item": item, "Score": score}
+
+
+async def test_search_native_projects_ttl_attribute_when_enabled(aws):
+    ddb, _ = aws
+    storage = make(aws, ttl_seconds=3600, ttl_attribute="ttl")
+    with mock.patch.object(ddb, "search_vectors", create=True, return_value={"SearchResults": []}) as sv:
+        await storage.search(SearchQuery(vector=[1.0], top_k=1, pk="tenant/a"))
+    req = sv.call_args.kwargs
+    assert req["ProjectionExpression"] == "#pk, #sk, #m, #ttl"
+    assert req["ExpressionAttributeNames"]["#ttl"] == "ttl"
+
+
+async def test_search_native_drops_expired_before_top_k_without_reads(aws):
+    """Expired hits are filtered from the projected TTL; hits without it are kept; no GetItem."""
+    ddb, _ = aws
+    storage = make(aws, ttl_seconds=3600)
+    now = int(time.time())
+    resp = {
+        "SearchResults": [
+            _ttl_hit("dead", 0.1, now - 60),
+            _ttl_hit("live", 0.2, now + 3600),
+            _ttl_hit("unstamped", 0.3),
+            _ttl_hit("overflow", 0.4, now + 3600),
+        ]
+    }
+    with (
+        mock.patch.object(ddb, "search_vectors", create=True, return_value=resp),
+        mock.patch.object(ddb, "get_item", wraps=ddb.get_item) as gi,
+    ):
+        results = await storage.search(SearchQuery(vector=[1.0], top_k=2, pk="tenant/a"))
+    assert [r.key for r in results] == ["tenant/a/live", "tenant/a/unstamped"]
+    assert gi.call_count == 0
+
+
+async def test_search_native_keeps_expired_when_ttl_disabled(aws):
+    ddb, _ = aws
+    storage = make(aws)
+    resp = {"SearchResults": [_ttl_hit("dead", 0.1, int(time.time()) - 60)]}
+    with mock.patch.object(ddb, "search_vectors", create=True, return_value=resp) as sv:
+        results = await storage.search(SearchQuery(vector=[1.0], top_k=1, pk="tenant/a"))
+    assert "#ttl" not in sv.call_args.kwargs["ExpressionAttributeNames"]
+    assert [r.key for r in results] == ["tenant/a/dead"]
+
+
+async def test_search_adapter_opts_in_to_ttl_with_expire_at(aws):
+    now = time.time()
+
+    async def adapter(params):
+        return [
+            {"key": "memory/u1/dead", "score": 0.9, "expire_at": now - 60},
+            {"key": "memory/u1/live", "score": 0.8, "expire_at": now + 3600},
+            {"key": "memory/u1/unstamped", "score": 0.7},
+            {"key": "memory/u1/unparseable", "score": 0.6, "expire_at": "soon"},
+        ]
+
+    storage = make(aws, ttl_seconds=3600, vector_search=adapter)
+    results = await storage.search(SearchQuery(vector=[1.0], top_k=4, pk="memory/u1"))
+    assert [r.key for r in results] == ["memory/u1/live", "memory/u1/unstamped", "memory/u1/unparseable"]
+
+
 # ------------------------------------------------------------ construction/errors
 
 
@@ -812,71 +877,3 @@ async def test_namespaced_view_can_query_its_own_partition(aws):
     await view.write("scopes/agent/a1/x", b"v")
     await s.write("sessions/s2/other", b"sibling")
     assert await view.list(DynamoDBListQuery(pk="sessions/s1")) == ["scopes/agent/a1/x"]
-
-
-@pytest.mark.parametrize("native", [False, True])
-@pytest.mark.parametrize("include_values", [False, True])
-@pytest.mark.parametrize("ttl_attribute", ["expireAt", "customTTL"])
-async def test_search_filters_ttl_from_base_table(aws, native, include_values, ttl_attribute):
-    """Stale index/adapter payloads and an unprojected TTL are ignored; the base table decides."""
-    ddb, s3 = aws
-    now = 1_800_000_000
-    matches = [
-        {"key": f"tenant/a/{key}", "score": score, "data": b"stale"}
-        for score, key in enumerate(["expired", "boundary", "deleted", "live", "legacy"])
-    ]
-    adapter = mock.AsyncMock(return_value=matches)
-    store = make(
-        aws,
-        prefix="tenant/a",
-        ttl_seconds=60,
-        ttl_attribute=ttl_attribute,
-        s3_bucket=BUCKET,
-        **({} if native else {"vector_search": adapter}),
-    )
-    with mock.patch("strands_dynamodb_storage.dynamodb_storage.time.time", return_value=now):
-        await store.write("expired", b"x" * 400_001, vector=[1.0], ttl_seconds=-1)
-        await store.write("boundary", b"x", vector=[1.0], ttl_seconds=0)
-        await store.write("live", b"current", vector=[1.0])
-        await make(aws, prefix="tenant/a").write("legacy", b"", vector=[1.0])
-        stale_index_response = {
-            "SearchResults": [
-                {
-                    "Item": {"pk": {"S": "tenant/a"}, "sk": {"S": m["key"].split("/")[-1]}, "data": {"B": b"stale"}},
-                    "Score": m["score"],
-                }
-                for m in matches
-            ]
-        }
-        with (
-            mock.patch.object(ddb, "search_vectors", create=True, return_value=stale_index_response),
-            mock.patch.object(ddb, "get_item", wraps=ddb.get_item) as get,
-            mock.patch.object(s3, "get_object", side_effect=AssertionError("expired S3 fetch")),
-        ):
-            results = await store.search(SearchQuery(vector=[1.0], top_k=5, include_values=include_values))
-        assert [r.key for r in results] == ["live", "legacy"]
-        assert [r.score for r in results] == [3, 4]
-        if include_values:
-            assert [r.data for r in results] == [b"current", b""]
-        checks = [c.kwargs for c in get.call_args_list if c.kwargs.get("ConsistentRead")]
-        assert len(checks) == 5
-        assert all(c["ExpressionAttributeNames"] == {"#pk": "pk", "#ttl": ttl_attribute} for c in checks)
-
-
-async def test_search_ttl_checks_scope_before_read_and_propagates_errors(aws):
-    adapter = mock.AsyncMock(return_value=[{"key": "other/a/x", "score": 0}])
-    store = make(aws, prefix="tenant/a", ttl_seconds=60, vector_search=adapter)
-    with mock.patch.object(aws[0], "get_item", side_effect=RuntimeError("unavailable")) as get:
-        assert await store.search(SearchQuery(vector=[1.0], top_k=1)) == []
-        get.assert_not_called()
-        adapter.return_value = [{"key": "tenant/a/x", "score": 0}]
-        with pytest.raises(StorageError, match="Failed to search"):
-            await store.search(SearchQuery(vector=[1.0], top_k=1))
-
-
-async def test_search_without_ttl_skips_liveness_read(aws):
-    adapter = mock.AsyncMock(return_value=[{"key": "mem/a/x", "score": 0}])
-    store = make(aws, vector_search=adapter)
-    with mock.patch.object(aws[0], "get_item", side_effect=AssertionError("unexpected read")):
-        results = await store.search(SearchQuery(vector=[1.0], top_k=1))
-    assert [r.key for r in results] == ["mem/a/x"]
