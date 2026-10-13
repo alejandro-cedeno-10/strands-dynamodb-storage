@@ -136,6 +136,9 @@ export interface LexicalQuery {
   includeValues?: boolean
 }
 
+/** A {@link LexicalQuery} whose text is already tokenized into terms. */
+type TermQuery = Omit<LexicalQuery, 'text'>
+
 /** Exact-match query over document identifiers. */
 export interface IdentifierQuery {
   /** Identifier to match exactly (case-sensitive). */
@@ -454,11 +457,20 @@ export class LexicalIndex {
   async search(query: LexicalQuery): Promise<LexicalSearchResponse> {
     return this._guard('search', undefined, async () => {
       assertTopK(query.topK)
-      const terms = this._queryTerms(query.text)
-      return this._retrieve(
-        terms.map((term) => termPostingPk(this.scope, term)),
-        retrievalOptions(query, query.requireAllTerms ?? false)
-      )
+      return this._retrieveTerms(textTerms(query.text), query)
+    })
+  }
+
+  /**
+   * {@link LexicalIndex.search} over already tokenized, distinct query `terms`, for `LexicalSearchStrategy`, which
+   * selects the terms itself. Internal: not part of the public API and may change without notice.
+   *
+   * @internal
+   */
+  async _searchTerms(terms: readonly string[], query: TermQuery): Promise<LexicalSearchResponse> {
+    return this._guard('search', undefined, async () => {
+      assertTopK(query.topK)
+      return this._retrieveTerms(terms, query)
     })
   }
 
@@ -779,8 +791,15 @@ export class LexicalIndex {
     return attribute === undefined ? [] : [attribute]
   }
 
-  private _queryTerms(text: string): string[] {
-    const terms = textTerms(text)
+  private async _retrieveTerms(terms: readonly string[], query: TermQuery): Promise<LexicalSearchResponse> {
+    this._assertQueryTerms(terms)
+    return this._retrieve(
+      terms.map((term) => termPostingPk(this.scope, term)),
+      retrievalOptions(query, query.requireAllTerms ?? false)
+    )
+  }
+
+  private _assertQueryTerms(terms: readonly string[]): void {
     assertEachFits(terms, this._limits.maxTermBytes, 'A query term', 'maxTermBytes')
     if (terms.length === 0) throw new StorageError('Lexical query contains no searchable terms')
     if (terms.length > this._limits.maxQueryTerms) {
@@ -788,7 +807,6 @@ export class LexicalIndex {
         `Lexical query has ${terms.length} distinct terms, above maxQueryTerms (${this._limits.maxQueryTerms})`
       )
     }
-    return terms
   }
 
   private async _retrieve(partitionKeys: string[], options: RetrievalOptions): Promise<LexicalSearchResponse> {
@@ -1073,7 +1091,14 @@ export class LexicalIndex {
   }
 }
 
-function resolveLimits(overrides: Partial<LexicalIndexLimits> | undefined): LexicalIndexLimits {
+/**
+ * Merges `overrides` over {@link DEFAULT_LEXICAL_INDEX_LIMITS} and validates the result. Internal: shared with
+ * `LexicalSearchStrategy` so its limits fail at construction rather than on the first write hook.
+ *
+ * @internal
+ * @throws {@link StorageError} if a limit is out of range
+ */
+export function resolveLimits(overrides: Partial<LexicalIndexLimits> | undefined): LexicalIndexLimits {
   const limits: LexicalIndexLimits = { ...DEFAULT_LEXICAL_INDEX_LIMITS }
   for (const name of LIMIT_NAMES) {
     const value = overrides?.[name]
@@ -1132,7 +1157,12 @@ function assertPositiveInteger(name: string, value: number): void {
   throw new StorageError(`${name} must be a positive integer; got ${value}`)
 }
 
-function assertTopK(topK: number): void {
+/**
+ * Rejects a `topK` outside 1 to 100. Internal: shared with `LexicalSearchStrategy`.
+ *
+ * @internal
+ */
+export function assertTopK(topK: number): void {
   if (Number.isInteger(topK) && topK >= 1 && topK <= MAX_TOP_K) return
   throw new StorageError(`topK must be an integer between 1 and ${MAX_TOP_K}; got ${topK}`)
 }
@@ -1345,7 +1375,10 @@ function matchesMetadataFilter(metadata: unknown, filter: MetadataFilter | undef
   )
 }
 
-function retrievalOptions(query: LexicalQuery | IdentifierQuery, requireAllTerms: boolean): RetrievalOptions {
+function retrievalOptions(
+  query: Pick<LexicalQuery, 'topK' | 'filter' | 'includeValues'>,
+  requireAllTerms: boolean
+): RetrievalOptions {
   return { topK: query.topK, filter: query.filter, includeValues: query.includeValues ?? false, requireAllTerms }
 }
 

@@ -56,7 +56,8 @@ await store.delete("sessions/s1/snapshot.json")
 - Optional per-item TTL (`ttl_seconds=...`) with read/list expiry filtering (search does not filter; see below).
 - Native vector `search()` via Amazon DynamoDB vector indexes (`SearchVectors`,
   requires boto3 >= 1.43.64); a `vector_search` adapter can override the call.
-- Opt-in `LexicalIndex` (preview) for term and exact-identifier retrieval; see below.
+- Opt-in `LexicalIndex` (preview) for term and exact-identifier retrieval, also usable by SDK
+  consumers as a `search_strategy`; see below.
 
 ## Semantic search
 
@@ -109,7 +110,8 @@ created index backfills before it is searchable. Requires `boto3 >= 1.43.64`; a
 (`search`) or by an exact identifier such as an error code (`lookup`). It owns the write path of
 indexed documents: `upsert` writes the document to the storage table and its index entries (a
 manifest plus one posting per term and identifier) to a separate index table in one
-`TransactWriteItems` call. `DynamoDBStorage.search()` and the byte `Storage` contract are unchanged.
+`TransactWriteItems` call. The byte `Storage` contract is unchanged; `DynamoDBStorage.search()`
+accepts a plain string only when a `search_strategy` is configured ([SDK search strategy](#sdk-search-strategy)).
 *Preview* means the API and the on-table layout (`lexical-v1`, `LEXICAL_TOKENIZER_VERSION`) may
 change before it is marked stable; the design is open for maintainer review.
 
@@ -253,13 +255,53 @@ overwritten, foreign or expired document, and optionally re-puts the postings of
 documents changed concurrently are skipped. Pass each `RepairReport.cursor` to the next call until
 it is `None`. Manifests never expire, so run `repair` periodically when documents use TTL.
 
+### SDK search strategy
+
+SDK consumers that only know the byte `Storage` API, such as the SDK `FileMemoryStore` (it calls
+`write` and then `search("natural language")`), can use the index through `LexicalSearchStrategy`.
+As with the SDK's own storage backends, `write()` passes each stored value to the strategy and a
+plain-string `search()` is delegated to it; a `SearchQuery` still takes the vector path. Without a
+strategy, a plain-string `search()` raises `StorageError`.
+
+```python
+from strands.vended_memory_stores import FileMemoryStore
+from strands_dynamodb_storage import DynamoDBStorage, LexicalSearchStrategy, SearchableText
+
+strategy = LexicalSearchStrategy(
+    index_table_name="agent-lexical-index",
+    extract=lambda key, data: SearchableText(text=data.decode("utf-8")),  # you choose what is searchable
+)
+storage = DynamoDBStorage("agent-data", region_name="us-east-1", search_strategy=strategy)
+memory = FileMemoryStore(storage=storage.namespace("tenant-a"), name="agent-memory")
+await memory.add("# User preferences\nPrefers dark mode")
+entries = await memory.search("which mode does the user prefer?")
+```
+
+- **Explicit extractor.** Bytes are never decoded implicitly: `extract(key, data)` returns
+  `SearchableText(text=..., identifiers=...)`, or `None` to leave the value unindexed (an earlier
+  indexed version of that key is then hidden from search, and `repair` removes its entries).
+  Extracted text is not truncated: its terms plus identifiers must fit `max_postings_per_document`
+  (default 49), as for `upsert`.
+- **One extra write, at-least-once.** `write()` stores the value, then the strategy stores it again
+  with its index entries through `upsert` (two strongly consistent reads and one transaction),
+  keeping `vector`, `metadata` and `ttl_seconds`. If that step fails (for example too many postings,
+  or a value offloaded to S3), `write()` raises `StorageError("Wrote '<key>' but indexing failed")`;
+  the value stays stored but not searchable until it is written again.
+  `LexicalIndex.upsert` remains the single-write, atomic path.
+- **First N query terms.** `search()` uses the first `max_query_terms` (default 16) distinct query
+  terms, skipping terms above `max_term_bytes`; a query without terms returns `[]`. It returns up to
+  `top_k` (default 10) results with `key`, `score` and, with `include_values=True` (the default),
+  `data`; truncation reasons are not reported.
+- Each namespaced view searches only its own scope. Searching through the strategy needs
+  strands-agents 1.54 or later (it returns the SDK's `StorageSearchResult`).
+
 ### Not supported
 
 S3 offload for indexed documents (a value that would offload is rejected); global tables or
 multi-Region use (transactions are atomic only in the Region where they run); online backfill
 (`repair` cannot re-tokenize because source text is not stored, so a tokenizer change requires
-re-upserting); SDK `SearchStrategy` integration; hybrid vector + lexical ranking (RRF, proposed as
-the next increment); BM25 or other corpus-statistics scoring; phrase or substring search.
+re-upserting); hybrid vector + lexical ranking (RRF, proposed as the next increment); BM25 or other
+corpus-statistics scoring; phrase or substring search.
 
 ## Examples
 
