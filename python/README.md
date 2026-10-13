@@ -53,7 +53,7 @@ await store.delete("sessions/s1/snapshot.json")
 - Single-table design (`pk`/`sk`), with a structured `DynamoDBListQuery` extension point.
 - Optional Amazon S3 offload for values above the item-size limit (`s3_bucket=...`).
 - Optional gzip `compression="gzip"` (applied before the offload check).
-- Optional per-item TTL (`ttl_seconds=...`) with read/list expiry filtering (search does not filter; see below).
+- Optional per-item TTL (`ttl_seconds=...`) with read/list/search expiry filtering.
 - Native vector `search()` via Amazon DynamoDB vector indexes (`SearchVectors`,
   requires boto3 >= 1.43.64); a `vector_search` adapter can override the call.
 
@@ -66,10 +66,19 @@ every search is scoped to the caller's key space -- one tenant's memories can ne
 in another's results. Creating the table with a vector index (and the IAM permissions needed)
 is covered in the repository README's [Provisioning and permissions](../#provisioning-and-permissions).
 
-Two behaviours to know: `pk` is required whenever the index's `SearchSchema` declares a HASH
-element (the provisioning guide's setup does) and must be omitted when it doesn't. And because
-TTL deletion is asynchronous, `search()` can briefly return items whose expiry has passed but
-which DynamoDB has not yet physically deleted -- expiry filtering applies to `read`/`list` only.
+`pk` is required whenever the index's `SearchSchema` declares a HASH
+element (the provisioning guide's setup does) and must be omitted when it doesn't.
+
+When TTL is enabled, `search()` checks each in-scope candidate with a strongly consistent
+`GetItem` against the base table, projecting only the partition key and configured TTL attribute.
+This works even when the vector index does not project TTL or a custom adapter returns stale payloads.
+Expired and missing items are omitted before fetching values from S3. Items without TTL remain eligible.
+This adds one base-table read per in-scope candidate (and requires `dynamodb:GetItem` permission);
+projection reduces response bytes, not read-capacity charges. Including values also performs the normal
+value read for each surviving candidate. TTL-disabled searches keep their existing read behavior.
+Filtering preserves ranking but can return fewer than the requested result count, including zero;
+no extra vector search is issued to refill results. This is a per-item expiry check, not a snapshot:
+concurrent updates and expiration after validation remain possible, and scores/metadata are eventually consistent.
 
 ```python
 from strands_dynamodb_storage import DynamoDBStorage, SearchQuery
