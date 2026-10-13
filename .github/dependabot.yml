@@ -74,6 +74,12 @@ updates:
     commit-message:
       prefix: 'ci(typescript)'
     versioning-strategy: increase-if-necessary
+    ignore:
+      # typescript-eslint 8.x declares typescript '>=4.8.4 <6.1.0' as its
+      # peer, so npm ci fails on typescript 7 (#57). Lift this once
+      # typescript-eslint publishes support for the 7.x line.
+      - dependency-name: 'typescript'
+        versions: ['>=7.0.0']
     cooldown:
       default-days: 7
       semver-major-days: 30
