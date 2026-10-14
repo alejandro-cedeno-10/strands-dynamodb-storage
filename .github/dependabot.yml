@@ -80,9 +80,9 @@ updates:
       # typescript-eslint publishes support for the 7.x line.
       - dependency-name: 'typescript'
         versions: ['>=7.0.0']
-      # package.json declares node >=20 and CI runs 20 and 22. Types above the
-      # highest tested runtime let tsc accept APIs CI never executes (#54,
-      # #104). Raise this floor when the CI matrix adds a newer Node line.
+      # package.json declares node >=22, so the types track the 22 line.
+      # Newer types let tsc accept APIs that the oldest supported runtime
+      # lacks (#54, #104). Raise this when the engines floor moves.
       - dependency-name: '@types/node'
         versions: ['>=23.0.0']
     cooldown:
