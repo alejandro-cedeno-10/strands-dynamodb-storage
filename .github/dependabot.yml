@@ -80,12 +80,36 @@ updates:
       # typescript-eslint publishes support for the 7.x line.
       - dependency-name: 'typescript'
         versions: ['>=7.0.0']
+      # package.json declares node >=20 and CI runs 20 and 22. Types above the
+      # highest tested runtime let tsc accept APIs CI never executes (#54,
+      # #104). Raise this floor when the CI matrix adds a newer Node line.
+      - dependency-name: '@types/node'
+        versions: ['>=23.0.0']
     cooldown:
       default-days: 7
       semver-major-days: 30
       semver-minor-days: 7
       semver-patch-days: 3
     groups:
+      # Peer-locked pairs. Each major has to land with its partner or npm ci
+      # fails on the peer range: @vitest/coverage-v8 pins the matching vitest
+      # major (#106, #108), and @eslint/js tracks the eslint major (#56).
+      # Majors only, so minor and patch bumps still flow through the
+      # development-dependencies group below.
+      vitest-major:
+        applies-to: version-updates
+        update-types:
+          - 'major'
+        patterns:
+          - 'vitest'
+          - '@vitest/*'
+      eslint-major:
+        applies-to: version-updates
+        update-types:
+          - 'major'
+        patterns:
+          - 'eslint'
+          - '@eslint/js'
       # Development dependency minor + patch bumps in one PR. Majors are
       # excluded so a breaking dev-tool bump (e.g. a typescript major ahead
       # of typescript-eslint peer support) arrives individually instead of
