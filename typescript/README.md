@@ -116,10 +116,15 @@ await store.write('sessions/tmp/x', data, { ttlSeconds: 3_600 })
 ```
 
 Stamps a DynamoDB-native epoch-seconds `expireAt` attribute (enable TTL on that attribute at the table level for physical
-cleanup). `read`/`list` also filter items whose expiry has passed, covering the lag before DynamoDB physically deletes
-them. With S3 offload, add an S3 lifecycle rule to reclaim offloaded objects (TTL removes only the DynamoDB pointer).
-Note that this filtering applies to `read`/`list` only: because TTL deletion is asynchronous, `search()` can briefly
-return items whose expiry has passed but which DynamoDB has not yet physically deleted.
+cleanup). `read`/`list`/`search` also filter items whose expiry has passed, covering the lag before DynamoDB physically
+deletes them. With S3 offload, add an S3 lifecycle rule to reclaim offloaded objects (TTL removes only the DynamoDB
+pointer).
+
+`search()` reads the TTL attribute from the vector index at no extra read cost, so the index must project it (`ALL`, or
+`INCLUDE` listing the TTL attribute); with a narrower projection matches are returned unfiltered. A `vectorSearch`
+adapter opts in by returning `expireAt` (epoch seconds) on each match. Expired matches are not back-filled, so a search
+can return fewer than `topK` results, and an item whose TTL was just renewed can be briefly hidden until the index
+catches up with the write.
 
 ## Semantic search — DynamoDB native vector index
 
