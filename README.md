@@ -140,7 +140,7 @@ The [Python README](python/) covers S3 offload, compression, TTL, multi-tenant p
 
 ### TypeScript
 
-Requires Node.js 20+:
+Requires Node.js 22+:
 
 ```bash
 npm install strands-dynamodb-storage
