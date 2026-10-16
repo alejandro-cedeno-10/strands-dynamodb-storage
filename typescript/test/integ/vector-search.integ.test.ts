@@ -78,7 +78,7 @@ describe.skipIf(!RUN)('DynamoDBStorage — native vector search (live)', () => {
 
     // Eventually consistent: poll until both items are visible to search.
     const deadline = Date.now() + 300_000
-    let results: SearchResult[] = []
+    let results: SearchResult[]
     for (;;) {
       results = await storage.search({ vector: [1, 0, 0, 0], topK: 2, pk: 'tenant/a' })
       if (results.length === 2) break
