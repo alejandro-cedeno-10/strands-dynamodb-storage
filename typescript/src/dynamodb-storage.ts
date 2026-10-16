@@ -68,7 +68,8 @@ export interface SearchResult {
 /**
  * Optional override for the vector-search call. By default {@link DynamoDBStorage.search}
  * issues DynamoDB `SearchVectors` natively (requires `@aws-sdk/client-dynamodb` >= 3.1103.0);
- * supply an adapter to replace the call (e.g. for testing or custom routing).
+ * supply an adapter to replace the call (e.g. for testing or custom routing). An adapter
+ * opts in to TTL filtering by returning each item's epoch-seconds expiry as `expireAt`.
  */
 export type VectorSearchAdapter = (params: {
   tableName: string
@@ -78,7 +79,7 @@ export type VectorSearchAdapter = (params: {
   vector: number[]
   topK: number
   filter?: Record<string, string | number | boolean>
-}) => Promise<Array<{ key: string; score: number; metadata?: Record<string, unknown> }>>
+}) => Promise<Array<{ key: string; score: number; metadata?: Record<string, unknown>; expireAt?: number }>>
 
 /**
  * Text search strategy that {@link DynamoDBStorage} delegates plain-string `search()` calls to, following the SDK
@@ -123,7 +124,7 @@ export interface DynamoDBStorageConfig {
   /**
    * Optional time-to-live in seconds. Setting it opts in to TTL: each written item
    * carries an epoch-seconds expiry attribute (see `ttlAttribute`) so DynamoDB native
-   * TTL reaps it, and `read`/`list` filter out items whose expiry has already passed —
+   * TTL reaps it, and `read`/`list`/`search` filter out items whose expiry has already passed —
    * covering the up-to-~48h lag before DynamoDB physically deletes them. A per-write
    * `ttlSeconds` tunes the duration for that write.
    * On an instance that did not opt in here, a per-write `ttlSeconds` is ignored.
@@ -482,10 +483,14 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
    * direction depends on the index's distance function: for COSINE and EUCLIDEAN
    * lower is closer; for DOT_PRODUCT higher is more similar. Results arrive in
    * the service's most-similar-first order. Like a global secondary index, the
-   * vector index is eventually consistent. Unlike `read`/`list`, results are not
-   * filtered for TTL expiry: because TTL deletion is asynchronous, a search can
-   * briefly return items whose expiry has passed but which DynamoDB has not yet
-   * physically deleted.
+   * vector index is eventually consistent.
+   *
+   * With TTL enabled, matches whose TTL attribute has passed are dropped, the same
+   * check `read` applies, without any extra reads: the native path projects the TTL
+   * attribute from the vector index, and an adapter opts in by returning `expireAt`
+   * on each match. A match that carries no expiry (an index that does not project the
+   * TTL attribute, or an adapter that does not return it) is kept. Expired matches are
+   * not back-filled, so a search can return fewer than `topK` results.
    *
    * A plain-string query (the SDK's natural-language form) is delegated to the configured
    * `searchStrategy`; its matches come back as `{ key, score, data? }`, without metadata.
@@ -498,8 +503,13 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
     if (typeof query === 'string') return this._searchText(query)
     if (query.pk !== undefined) this._assertPkInScope(query.pk)
     try {
-      const matches: Array<{ key: string; score: number; metadata?: Record<string, unknown>; data?: Uint8Array }> = this
-        ._vectorSearch
+      const matches: Array<{
+        key: string
+        score: number
+        metadata?: Record<string, unknown>
+        data?: Uint8Array
+        expireAt?: number
+      }> = this._vectorSearch
         ? await this._vectorSearch({
             tableName: this._tableName,
             indexName: this._indexName,
@@ -517,6 +527,7 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
         // foreign key would otherwise be handed back looking like one of ours.
         const key = this._stripPrefix(match.key)
         if (key === null) continue
+        if (this._ttlEnabled && this._hasPassed(match.expireAt)) continue
         const result: SearchResult = { key, score: match.score }
         if (match.metadata !== undefined) result.metadata = match.metadata
         if (query.includeValues) {
@@ -580,7 +591,8 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
    * after the search, with the request over-fetching (capped at the service
    * TopK limit of 100) so filtering doesn't silently drop results below
    * `topK`; a filtered search can still return fewer than `topK` matches once
-   * the cap truncates the over-fetch.
+   * the cap truncates the over-fetch. With TTL enabled, the TTL attribute is
+   * projected and expired matches are dropped before counting towards `topK`.
    */
   private async _nativeVectorSearch(
     query: SearchQuery
@@ -610,6 +622,10 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
       Object.assign(names, { '#d': DATA_ATTR, '#s3': S3_ATTR, '#z': Z_ATTR })
       projection += ', #d, #s3, #z'
     }
+    if (this._ttlEnabled) {
+      names['#ttl'] = this._ttlAttribute
+      projection += ', #ttl'
+    }
     const response = await client.send(
       new SearchVectorsCommand({
         TableName: this._tableName,
@@ -632,6 +648,7 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
       const pk = item[PK] as string
       const sk = (item[SK] as string | undefined) ?? ''
       const fullKey = sk === '' || sk === '\u0000' ? pk : `${pk}/${sk}`
+      if (this._ttlEnabled && this._isExpired(item)) continue
       const metadata = item[META_ATTR] as Record<string, unknown> | undefined
       if (query.filter !== undefined && !DynamoDBStorage._matchesSearchFilter(metadata, query.filter)) continue
       const match: { key: string; score: number; metadata?: Record<string, unknown>; data?: Uint8Array } = {
@@ -775,8 +792,12 @@ export class DynamoDBStorage implements Storage<string | DynamoDBListQuery> {
 
   /** True when the item carries a TTL attribute whose epoch-seconds value has passed. */
   private _isExpired(item: Record<string, unknown>): boolean {
-    const exp = item[this._ttlAttribute]
-    return typeof exp === 'number' && exp <= Math.floor(Date.now() / 1000)
+    return this._hasPassed(item[this._ttlAttribute])
+  }
+
+  /** True when `epochSeconds` is a number at or before now. */
+  private _hasPassed(epochSeconds: unknown): boolean {
+    return typeof epochSeconds === 'number' && epochSeconds <= Math.floor(Date.now() / 1000)
   }
 
   /**

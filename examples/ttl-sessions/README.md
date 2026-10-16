@@ -72,8 +72,10 @@ raw GetItem still returns an item: True (reaper removes it in the background)
 
 ## Considerations
 
-- TTL filtering applies to `read` and `list`. `search()` can briefly return
-  an expired item that DynamoDB has not yet physically removed.
+- TTL filtering applies to `read`, `list` and `search`. `search()` reads the
+  TTL attribute from the vector index, so the index must project it (`ALL` or
+  `INCLUDE`); with a `KEYS_ONLY` projection, expired items can still surface
+  until DynamoDB physically removes them.
 - If you combine TTL with S3 offload, add an S3 lifecycle rule as the
   backstop: DynamoDB reaping an expired pointer item does not delete its S3
   object.

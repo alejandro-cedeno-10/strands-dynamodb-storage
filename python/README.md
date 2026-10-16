@@ -53,7 +53,7 @@ await store.delete("sessions/s1/snapshot.json")
 - Single-table design (`pk`/`sk`), with a structured `DynamoDBListQuery` extension point.
 - Optional Amazon S3 offload for values above the item-size limit (`s3_bucket=...`).
 - Optional gzip `compression="gzip"` (applied before the offload check).
-- Optional per-item TTL (`ttl_seconds=...`) with read/list expiry filtering (search does not filter; see below).
+- Optional per-item TTL (`ttl_seconds=...`) with read/list/search expiry filtering.
 - Native vector `search()` via Amazon DynamoDB vector indexes (`SearchVectors`,
   requires boto3 >= 1.43.64); a `vector_search` adapter can override the call.
 - Opt-in `LexicalIndex` (preview) for term and exact-identifier retrieval, also usable by SDK
@@ -69,9 +69,13 @@ in another's results. Creating the table with a vector index (and the IAM permis
 is covered in the repository README's [Provisioning and permissions](../#provisioning-and-permissions).
 
 Two behaviours to know: `pk` is required whenever the index's `SearchSchema` declares a HASH
-element (the provisioning guide's setup does) and must be omitted when it doesn't. And because
-TTL deletion is asynchronous, `search()` can briefly return items whose expiry has passed but
-which DynamoDB has not yet physically deleted -- expiry filtering applies to `read`/`list` only.
+element (the provisioning guide's setup does) and must be omitted when it doesn't. And with TTL
+enabled, `search()` drops matches whose expiry has passed, reading the TTL attribute from the vector
+index at no extra read cost. That needs the index to project it (`ALL`, or `INCLUDE` listing the TTL
+attribute); with a narrower projection matches are returned unfiltered. A `vector_search` adapter opts
+in by returning `expire_at` (epoch seconds) on each match. Expired matches are not back-filled, so a
+search can return fewer than `top_k` results, and an item whose TTL was just renewed can be briefly
+hidden until the index catches up with the write.
 
 ```python
 from strands_dynamodb_storage import DynamoDBStorage, SearchQuery
